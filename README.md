@@ -19,7 +19,7 @@ git clone https://github.com/yagizharman/telegram-message-sender.git
 pip install -r requirements.txt
 ```
 
-3- Create a .env file in the project directory and add your configuration details. The file should look like this:
+3- Create a `.env` file in the project directory and add your configuration details. The file should look like this:
 
 ```
 API_ID=your_api_id

@@ -12,7 +12,6 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-source_group_id = os.getenv("SOURCE_GROUP_ID")
 target_group_ids_str = os.getenv("TARGET_GROUP_IDS")
 
 try:
@@ -30,14 +29,15 @@ message_queue = asyncio.Queue()
 async def process_message():
     while True:
         channel_username, message = await message_queue.get()
+        message_id = message.id
         for group_id in target_group_ids:
             try:
                 await client.forward_messages(group_id, message)
-                print(f"Message forwarded to group with ID {group_id} from {channel_username}")
+                print(f"Message ID:{message_id} forwarded to group with ID {group_id} from {channel_username}")
             except Exception as e:
                 print(f"Error forwarding message to group with ID {group_id} from {channel_username}: {e}")
         
-        random_number = random.randint(0, 10)
+        random_number = random.randint(int(os.getenv("MIN_TIME")), int(os.getenv("MAX_TIME")))
         print(f"Time interval randomly chosen for {channel_username} is: {random_number}")
         await asyncio.sleep(random_number)
 
@@ -57,7 +57,7 @@ for channel_username in channel_usernames:
 
 async def get_group_ids():
     await client.start(PHONE_NUMBER)
-    
+    print("Group ids updated")
     # Get all dialogs (conversations)
     dialogs = await client.get_dialogs()
 

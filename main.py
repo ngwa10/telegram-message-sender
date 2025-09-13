@@ -21,7 +21,6 @@ source_group_id1 = int(os.getenv("SOURCE_GROUP_ID1"))
 source_group_id2 = int(os.getenv("SOURCE_GROUP_ID2"))
 source_group_id3 = int(os.getenv("SOURCE_GROUP_ID3"))
 source_group_id4 = int(os.getenv("SOURCE_GROUP_ID4"))
-
 source_group_ids = [source_group_id1, source_group_id2, source_group_id3, source_group_id4]
 
 # Create the Telegram client
@@ -55,17 +54,18 @@ async def extract_signal(message):
             signal["entry_time"] = match.group(0)
             logger.info(f"Extracted entry time: {signal['entry_time']}")
 
-        # Extract martingale levels
-        levels = []
+        # Assign default martingale levels for the specific channel
         if message.chat_id == source_group_id4:
-            levels = [{"level": 1, "time": None}, {"level": 2, "time": None}]
+            signal["martingale_levels"] = [{"level": 1, "time": None}, {"level": 2, "time": None}]
+            logger.info(f"Assigned default martingale levels: {signal['martingale_levels']}")
         else:
+            levels = []
             for line in text.splitlines():
                 match = re.search(r"(\d+️⃣ level at (\d{2}:\d{2}))", line)
                 if match:
                     levels.append({"level": len(levels) + 1, "time": match.group(2)})
-        signal["martingale_levels"] = levels
-        logger.info(f"Extracted martingale levels: {signal['martingale_levels']}")
+            signal["martingale_levels"] = levels
+            logger.info(f"Extracted martingale levels: {signal.get('martingale_levels')}")
 
         return signal
     except Exception as e:
@@ -114,5 +114,4 @@ async def main():
     except Exception as e:
         logger.error(f"Error in main: {e}")
 
-with client:
-    client.loop.run_until_complete(main())
+with client

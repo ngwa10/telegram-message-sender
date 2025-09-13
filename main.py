@@ -29,7 +29,7 @@ client = TelegramClient('userbot_session', API_ID, API_HASH)
 # Message queue
 message_queue = asyncio.Queue()
 
-async def extract_signal(message):
+async def extract_signal(message, source_group_id):
     try:
         signal = {}
         text = message.message
@@ -59,16 +59,35 @@ async def extract_signal(message):
             signal["entry_time"] = match.group(0)
             logger.info(f"Extracted entry time: {signal['entry_time']}")
 
+        # Extract entry price
+        match = re.search(r"Entry: (\d{1,5}\.\d{1,5})", text)
+        if match:
+            signal["entry_price"] = match.group(1)
+            logger.info(f"Extracted entry price: {signal['entry_price']}")
+
+        # Extract martingale levels
+        match = re.search(r"Martingale: (\d)", text)
+        if match:
+            signal["martingale_levels"] = match.group(1)
+            logger.info(f"Extracted martingale levels: {signal['martingale_levels']}")
+        elif source_group_id == source_group_id4:
+            signal["martingale_levels"] = 2
+            logger.info(f"Assigned default martingale levels: {signal['martingale_levels']}")
+
+        if not signal:
+            logger.info(f"No signal found in message: {message.id}")
         return signal
     except Exception as e:
         logger.error(f"Error extracting signal: {e}")
         return None
 
 async def process_message():
+    logger.info("Waiting for messages...")
     while True:
         try:
-            message = await message_queue.get()
-            signal = await extract_signal(message)
+            message, source_group_id = await message_queue.get()
+            logger.info(f"Received message: {message.id} from group {source_group_id}")
+            signal = await extract_signal(message, source_group_id)
             if signal:
                 logger.info(f"Extracted signal: {signal}")
             await asyncio.sleep(1)  # Add a small delay
@@ -76,10 +95,10 @@ async def process_message():
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 
-async def add_message_to_queue(message):
+async def add_message_to_queue(message, source_group_id):
     try:
-        await message_queue.put(message)
-        logger.info(f"Added message to queue: {message.id}")
+        await message_queue.put((message, source_group_id))
+        logger.info(f"Added message to queue: {message.id} from group {source_group_id}")
     except Exception as e:
         logger.error(f"Error adding message to queue: {e}")
 
@@ -88,33 +107,5 @@ async def handler(event):
     try:
         message = event.message
         logger.info(f"New message detected in source group with ID {event.chat_id}: {message.id}")
-        await add_message_to_queue(message)
+        await add_message_to_queue(message, event.chat_id)
     except Exception as e:
-        logger.error(f"Error handling new message: {e}")
-
-forward_from_channel_id = int(os.getenv("FORWARD_FROM_CHANNEL_ID", -1002197451859))
-@client.on(events.NewMessage(chats=forward_from_channel_id))
-async def forward_handler(event):
-    try:
-        message = event.message
-        logger.info(f"New message detected in forward channel with ID {event.chat_id}: {message.id}")
-        await client.forward_messages(source_group_id1, message)
-        logger.info(f"Message forwarded to source group with ID {source_group_id1}")
-    except Exception as e:
-        logger.error(f"Error forwarding message: {e}")
-
-async def main():
-    try:
-        await client.start(PHONE_NUMBER)
-        logger.info("Client Created")
-
-        # Start the message processing task
-        asyncio.create_task(process_message())
-
-        # Run the event handler until the script is stopped
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main())

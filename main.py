@@ -109,3 +109,4 @@ async def handler(event):
         logger.info(f"New message detected in source group with ID {event.chat_id}: {message.id}")
         await add_message_to_queue(message, event.chat_id)
     except Exception as e:
+        logger.error

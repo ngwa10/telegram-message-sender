@@ -5,24 +5,24 @@ import re
 import sys
 from dotenv import find_dotenv, load_dotenv
 from telethon import TelegramClient, events
-from telethon.tl.types import Message
+from telethon.tl.types import Message, PeerChannel
 
-# Set up logging
+# --- Logging setup ---
 logging.basicConfig(
-    level=logging.DEBUG, 
+    level=logging.INFO,  # Change to DEBUG for more detailed output
     format='[%(asctime)s] %(levelname)s - %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# --- Load environment variables ---
 if not find_dotenv():
     logger.error("No .env file found.")
     sys.exit(1)
 load_dotenv(find_dotenv())
 
-# API_ID, API_HASH, and PHONE_NUMBER
+# --- API Credentials and Phone Number ---
 try:
     API_ID = os.getenv("API_ID")
     API_HASH = os.getenv("API_HASH")
@@ -34,31 +34,28 @@ except (ValueError, TypeError) as e:
     logger.error(f"Failed to load environment variables: {e}")
     sys.exit(1)
 
-# Source group IDs
+# --- Source Group IDs ---
 try:
     source_group_ids = [
-        int(os.getenv("SOURCE_GROUP_ID1")),
-        int(os.getenv("SOURCE_GROUP_ID2")),
-        int(os.getenv("SOURCE_GROUP_ID3")),
-        int(os.getenv("SOURCE_GROUP_ID4"))
+        int(gid) for gid in [
+            os.getenv("SOURCE_GROUP_ID1"),
+            os.getenv("SOURCE_GROUP_ID2"),
+            os.getenv("SOURCE_GROUP_ID3"),
+            os.getenv("SOURCE_GROUP_ID4")
+        ] if gid is not None and gid.strip()
     ]
-    # Remove any None or empty values if some group IDs are not set
-    source_group_ids = [gid for gid in source_group_ids if gid is not None]
     if not source_group_ids:
         raise ValueError("No valid SOURCE_GROUP_ID found in .env")
 except (ValueError, TypeError) as e:
     logger.error(f"Failed to load group IDs from .env: {e}")
     sys.exit(1)
 
-# Create the Telegram client instance
+# --- Telegram Client and Queue ---
 client = TelegramClient('userbot_session', API_ID, API_HASH)
-
-# Message queue
 message_queue = asyncio.Queue()
 
 # Identify the specific source for default martingale levels
 source4_id = int(os.getenv("SOURCE_GROUP_ID4")) if os.getenv("SOURCE_GROUP_ID4") else None
-
 
 async def extract_signal(message: Message, source_group_id: int):
     """Extracts a trading signal from a message based on various formats."""
@@ -144,8 +141,6 @@ async def process_message_queue():
             signal = await extract_signal(message, source_group_id)
             if signal:
                 logger.info(f"Processed signal: {signal}")
-
-            await asyncio.sleep(1)
             message_queue.task_done()
         except asyncio.CancelledError:
             logger.warning("Message processing queue task cancelled.")
@@ -154,13 +149,30 @@ async def process_message_queue():
             logger.error(f"Error processing message from queue: {e}", exc_info=True)
             message_queue.task_done()
 
+async def periodic_channel_check(client, group_ids, interval=300):
+    """
+    Periodically fetches messages from specified channels to keep the update
+    stream active. This is a workaround for Telegram's selective update behavior.
+    """
+    logger.info("Starting periodic channel check task.")
+    while True:
+        for group_id in group_ids:
+            try:
+                entity = await client.get_entity(PeerChannel(group_id * -1))
+                # Fetching the last message forces an update from Telegram's servers.
+                await client.get_messages(entity, limit=1)
+                logger.debug(f"Manually fetched update for channel {group_id} ({entity.title}).")
+            except Exception as e:
+                logger.error(f"Failed to perform periodic check for channel {group_id}: {e}")
+        await asyncio.sleep(interval) # Wait for the specified interval (e.g., 5 minutes)
+
+
 @client.on(events.NewMessage(chats=source_group_ids))
 async def handler(event):
     """Event handler for new messages in specified chats."""
     try:
-        if event.chat_id in source_group_ids:
-            message = event.message
-            await message_queue.put((message, event.chat_id))
+        message = event.message
+        await message_queue.put((message, event.chat_id))
     except Exception as e:
         logger.error(f"Error in event handler for message {event.message.id}: {e}", exc_info=True)
 
@@ -171,30 +183,37 @@ async def main():
         await client.start(phone=PHONE_NUMBER)
         logger.info("Client started and connected successfully.")
         
+        # Verify membership for all channels
         for group_id in source_group_ids:
             try:
                 entity = await client.get_entity(group_id)
                 logger.info(f"Verified membership for group: {group_id} ({entity.title})")
             except ValueError:
                 logger.error(f"Client is not a member of group with ID: {group_id}. Cannot listen for messages.")
+        
+        # Start the message processing and periodic checking tasks
+        processor_task = asyncio.create_task(process_message_queue())
+        periodic_task = asyncio.create_task(periodic_channel_check(client, source_group_ids))
+
+        await client.run_until_disconnected()
+        logger.info("Client disconnected. Shutting down...")
 
     except Exception as e:
         logger.error(f"Failed to start Telethon client: {e}", exc_info=True)
         return
 
-    processor_task = asyncio.create_task(process_message_queue())
-    await client.run_until_disconnected()
-    logger.info("Client disconnected. Shutting down...")
-
-    try:
-        await asyncio.wait_for(message_queue.join(), timeout=30.0)
-    except asyncio.TimeoutError:
-        logger.warning("Queue did not empty in time. Some messages may not be processed.")
-
-    processor_task.cancel()
-    await asyncio.gather(processor_task, return_exceptions=True)
-    await client.disconnect()
-    logger.info("Application shutdown complete.")
+    finally:
+        try:
+            # Cleanup tasks gracefully
+            await asyncio.wait_for(message_queue.join(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("Queue did not empty in time. Some messages may not be processed.")
+        
+        processor_task.cancel()
+        periodic_task.cancel()
+        await asyncio.gather(processor_task, periodic_task, return_exceptions=True)
+        await client.disconnect()
+        logger.info("Application shutdown complete.")
 
 if __name__ == '__main__':
     try:
@@ -204,4 +223,5 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"An unhandled error occurred: {e}", exc_info=True)
         sys.exit(1)
-    
+
+            

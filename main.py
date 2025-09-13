@@ -35,37 +35,29 @@ async def extract_signal(message):
         text = message.message
 
         # Extract currency pair
-        match = re.search(r" + [A-Z]{3,5})", text)
+        match = re.search(r"([A-Z]{3,5}/[A-Z]{3,5}-[A-Z]{3})", text)
         if match:
-            signal["currency_pair"] = match.group(0).replace("-", "/")
+            signal["currency_pair"] = match.group(0)
             logger.info(f"Extracted currency pair: {signal['currency_pair']}")
+        else:
+            match = re.search(r"([A-Z]{3,5}[A-Z]{3,5}-[A-Z]{3})", text)
+            if match:
+                signal["currency_pair"] = match.group(0)
+                logger.info(f"Extracted currency pair: {signal['currency_pair']}")
 
         # Extract direction (Buy or Sell or Call)
-        if "BUY" in text.upper() or "🟩" in text or "CALL" in text.upper() or "🔼" in text:
-            signal["direction"] = "BUY" if "BUY" in text.upper() or "🟩" in text else "CALL"
+        if "CALL" in text.upper() or "🟩" in text or "🔼" in text:
+            signal["direction"] = "CALL"
             logger.info(f"Extracted direction: {signal['direction']}")
         elif "SELL" in text.upper() or "🟥" in text:
             signal["direction"] = "SELL"
             logger.info(f"Extracted direction: {signal['direction']}")
 
         # Extract entry time
-        match = re.search(r"(\d{2}:\d{2})", text)
+        match = re.search(r"(\d{2}:\d{2}:\d{2})", text)
         if match:
             signal["entry_time"] = match.group(0)
             logger.info(f"Extracted entry time: {signal['entry_time']}")
-
-        # Assign default martingale levels for the specific channel
-        if message.chat_id == source_group_id4:
-            signal["martingale_levels"] = [{"level": 1, "time": None}, {"level": 2, "time": None}]
-            logger.info(f"Assigned default martingale levels: {signal['martingale_levels']}")
-        else:
-            levels = []
-            for line in text.splitlines():
-                match = re.search(r"(\d+️⃣ level at (\d{2}:\d{2}))", line)
-                if match:
-                    levels.append({"level": len(levels) + 1, "time": match.group(2)})
-            signal["martingale_levels"] = levels
-            logger.info(f"Extracted martingale levels: {signal.get('martingale_levels')}")
 
         return signal
     except Exception as e:
@@ -99,7 +91,7 @@ async def main():
         # Start the message processing task
         asyncio.create_task(process_message())
 
-        # Set up event handler
+        # Set up event handler for source groups
         @client.on(events.NewMessage(chats=source_group_ids))
         async def handler(event):
             try:
@@ -109,9 +101,21 @@ async def main():
             except Exception as e:
                 logger.error(f"Error handling new message: {e}")
 
+        # Set up event handler to forward messages from specific channel to source_group_id1
+        forward_from_channel_id = int(os.getenv("FORWARD_FROM_CHANNEL_ID", -1002197451859))
+        @client.on(events.NewMessage(chats=forward_from_channel_id))
+        async def forward_handler(event):
+            try:
+                message = event.message
+                logger.info(f"New message detected in forward channel with ID {event.chat_id}: {message.id}")
+                await client.forward_messages(source_group_id1, message)
+                logger.info(f"Message forwarded to source group with ID {source_group_id1}")
+            except Exception as e:
+                logger.error(f"Error forwarding message: {e}")
+
         # Run the event handler until the script is stopped
         await client.run_until_disconnected()
     except Exception as e:
         logger.error(f"Error in main: {e}")
 
-client.loop.run_until_complete(main())
+client.loop

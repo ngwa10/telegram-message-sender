@@ -112,4 +112,9 @@ async def main():
         asyncio.create_task(process_message())
 
         # Run the event handler until the script is stopped
-        await client.run
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())

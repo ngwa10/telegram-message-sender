@@ -83,6 +83,26 @@ async def add_message_to_queue(message):
     except Exception as e:
         logger.error(f"Error adding message to queue: {e}")
 
+@client.on(events.NewMessage(chats=source_group_ids))
+async def handler(event):
+    try:
+        message = event.message
+        logger.info(f"New message detected in source group with ID {event.chat_id}: {message.id}")
+        await add_message_to_queue(message)
+    except Exception as e:
+        logger.error(f"Error handling new message: {e}")
+
+forward_from_channel_id = int(os.getenv("FORWARD_FROM_CHANNEL_ID", -1002197451859))
+@client.on(events.NewMessage(chats=forward_from_channel_id))
+async def forward_handler(event):
+    try:
+        message = event.message
+        logger.info(f"New message detected in forward channel with ID {event.chat_id}: {message.id}")
+        await client.forward_messages(source_group_id1, message)
+        logger.info(f"Message forwarded to source group with ID {source_group_id1}")
+    except Exception as e:
+        logger.error(f"Error forwarding message: {e}")
+
 async def main():
     try:
         await client.start(PHONE_NUMBER)
@@ -91,31 +111,5 @@ async def main():
         # Start the message processing task
         asyncio.create_task(process_message())
 
-        # Set up event handler for source groups
-        @client.on(events.NewMessage(chats=source_group_ids))
-        async def handler(event):
-            try:
-                message = event.message
-                logger.info(f"New message detected in source group with ID {event.chat_id}: {message.id}")
-                await add_message_to_queue(message)
-            except Exception as e:
-                logger.error(f"Error handling new message: {e}")
-
-        # Set up event handler to forward messages from specific channel to source_group_id1
-        forward_from_channel_id = int(os.getenv("FORWARD_FROM_CHANNEL_ID", -1002197451859))
-        @client.on(events.NewMessage(chats=forward_from_channel_id))
-        async def forward_handler(event):
-            try:
-                message = event.message
-                logger.info(f"New message detected in forward channel with ID {event.chat_id}: {message.id}")
-                await client.forward_messages(source_group_id1, message)
-                logger.info(f"Message forwarded to source group with ID {source_group_id1}")
-            except Exception as e:
-                logger.error(f"Error forwarding message: {e}")
-
         # Run the event handler until the script is stopped
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-
-client.loop
+        await client.run

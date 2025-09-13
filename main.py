@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import random
 import re
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -18,7 +17,7 @@ API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
 # Source group IDs
-source_group_id1 = int(os.environ("SOURCE_GROUP_ID1"))
+source_group_id1 = int(os.getenv("SOURCE_GROUP_ID1"))
 source_group_id2 = int(os.getenv("SOURCE_GROUP_ID2"))
 source_group_id3 = int(os.getenv("SOURCE_GROUP_ID3"))
 source_group_id4 = int(os.getenv("SOURCE_GROUP_ID4"))

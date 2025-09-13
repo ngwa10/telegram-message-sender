@@ -35,7 +35,7 @@ async def extract_signal(message):
         text = message.message
 
         # Extract currency pair
-        match = re.search(r"([A-Z]{3,5}/[A-Z]{3,5}|[A-Z]{3,5}[A-Z]{3,5})", text)
+        match = re.search(r" + [A-Z]{3,5})", text)
         if match:
             signal["currency_pair"] = match.group(0).replace("-", "/")
             logger.info(f"Extracted currency pair: {signal['currency_pair']}")
@@ -114,4 +114,4 @@ async def main():
     except Exception as e:
         logger.error(f"Error in main: {e}")
 
-with client
+client.loop.run_until_complete(main())

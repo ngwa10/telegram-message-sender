@@ -5,7 +5,7 @@ import re
 import sys
 from dotenv import find_dotenv, load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import ChannelPrivateError, RpcError
+from telethon.errors import ChannelPrivateError, RPCError
 from telethon.tl.types import Message
 
 # --- Logging setup ---
@@ -70,10 +70,9 @@ async def resolve_channel(client, group_ref):
     and resolved_by is one of: 'get_entity', 'get_input_entity'
     Raises the original exception if resolution fails.
     """
-    # Normalize numeric forms
     try:
+        # Normalize numeric forms like '-100123...' to int where possible
         if isinstance(group_ref, str) and group_ref.startswith('-100'):
-            # Telethon often expects the positive ID when resolving via API
             try:
                 group_ref = int(group_ref)
             except Exception:
@@ -83,7 +82,7 @@ async def resolve_channel(client, group_ref):
         try:
             ent = await client.get_entity(group_ref)
             return ent, 'get_entity'
-        except (ValueError, TypeError, RpcError) as e:
+        except (ValueError, TypeError, RPCError) as e:
             # Fall back to get_input_entity which can fetch an input peer
             logger.debug("get_entity failed for %r: %s. Falling back to get_input_entity", group_ref, e)
 

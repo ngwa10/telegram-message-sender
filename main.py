@@ -7,7 +7,7 @@ import json
 from dotenv import find_dotenv, load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import ChannelPrivateError, RPCError
-from telethon.tl.types import Message, PeerChannel
+from telethon.tl.types import Message
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -52,7 +52,7 @@ except (ValueError, TypeError) as e:
     logger.error(f"Failed to load group IDs from .env: {e}")
     sys.exit(1)
 
-# --- Entity Cache (id + access_hash persistence) ---
+# --- Entity Cache ---
 ENTITY_CACHE_FILE = "entities.json"
 entity_cache = {}
 if os.path.exists(ENTITY_CACHE_FILE):
@@ -78,21 +78,22 @@ def save_entity_to_cache(group_id: int, entity):
 
 async def resolve_channel(client, group_id: int):
     """
-    Resolve channel entity using cache, InputPeerChannel fallback, or get_entity.
+    Resolve channel entity correctly using Telethon's get_entity.
+    Works with numeric IDs, usernames, or cached entities.
     """
     try:
+        # Try cache first
         if str(group_id) in entity_cache:
             cached = entity_cache[str(group_id)]
-            if cached.get("access_hash"):
-                try:
-                    ent = await client.get_input_entity(PeerChannel(cached["id"]))
-                    logger.debug("Resolved group %s from cache.", group_id)
-                    return ent, "cache"
-                except Exception as e:
-                    logger.warning("Cache entity for %s failed: %s. Retrying full resolve...", group_id, e)
+            try:
+                ent = await client.get_input_entity(cached["id"])
+                logger.debug(f"Resolved group {group_id} from cache.")
+                return ent, "cache"
+            except Exception as e:
+                logger.warning(f"Cache failed for {group_id}: {e}. Trying fresh resolve...")
 
-        # Fallback: resolve directly
-        ent = await client.get_entity(PeerChannel(abs(group_id)))
+        # Resolve fresh using numeric ID
+        ent = await client.get_entity(group_id)
         save_entity_to_cache(group_id, ent)
         return ent, "fresh"
 
@@ -100,6 +101,8 @@ async def resolve_channel(client, group_id: int):
         logger.error(f"Group {group_id} is private or inaccessible.")
     except RPCError as e:
         logger.error(f"RPCError resolving group {group_id}: {e}")
+    except ValueError as e:
+        logger.error(f"Cannot resolve group {group_id}: {e}")
     except Exception as e:
         logger.error(f"Unexpected error resolving group {group_id}: {e}", exc_info=True)
 
@@ -125,7 +128,6 @@ async def extract_signal(message: Message, source_group_id: int):
             r"(?:PAIR:?|CURRENCY PAIR:?|PAIR\s*:?|CURRENCY\s*PAIR\s*:?)\s*([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3})?)|"
             r"([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3,5})?)"
         )
-        direction_pattern = re.compile(r"(?i)(BUY|CALL|SELL)|(🟩|🟥|🔼|🔽|🟢)")
         entry_time_pattern = re.compile(
             r"(?:Entry at|ENTRY at|Entry time|TIME \(UTC.*?\)):?\s+(\d{1,2}:\d{2}(?::\d{2})?)|"
             r"([0-9]+\:[0-9]+)\s*:\s*(?:CALL|SELL)"
@@ -258,4 +260,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Unhandled error: {e}", exc_info=True)
         sys.exit(1)
-          
+    

@@ -158,7 +158,7 @@ async def periodic_channel_check(client, group_ids, interval=300):
     while True:
         for group_id in group_ids:
             try:
-                # Use abs(group_id) for the PeerChannel constructor
+                # FIX: Use abs(group_id) for the PeerChannel constructor
                 entity = await client.get_entity(PeerChannel(abs(group_id)))
                 # Fetching the last message forces an update from Telegram's servers.
                 await client.get_messages(entity, limit=1)

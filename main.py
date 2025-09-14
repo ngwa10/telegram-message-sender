@@ -3,15 +3,13 @@ import logging
 import os
 import re
 import sys
-import json
 from dotenv import find_dotenv, load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import ChannelPrivateError, RPCError
 from telethon.tl.types import Message
 
 # --- Logging setup ---
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more detail
+    level=logging.INFO,  # Change to DEBUG for detailed output
     format='[%(asctime)s] %(levelname)s - %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
@@ -24,14 +22,13 @@ if not find_dotenv():
     sys.exit(1)
 load_dotenv(find_dotenv())
 
-# --- API Credentials and Phone Number ---
+# --- API Credentials ---
 try:
-    API_ID = os.getenv("API_ID")
+    API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
     PHONE_NUMBER = os.getenv("PHONE_NUMBER")
     if not all([API_ID, API_HASH, PHONE_NUMBER]):
         raise ValueError("API_ID, API_HASH, or PHONE_NUMBER not set in .env")
-    API_ID = int(API_ID)
 except (ValueError, TypeError) as e:
     logger.error(f"Failed to load environment variables: {e}")
     sys.exit(1)
@@ -52,125 +49,87 @@ except (ValueError, TypeError) as e:
     logger.error(f"Failed to load group IDs from .env: {e}")
     sys.exit(1)
 
-# --- Entity Cache ---
-ENTITY_CACHE_FILE = "entities.json"
-entity_cache = {}
-if os.path.exists(ENTITY_CACHE_FILE):
-    try:
-        with open(ENTITY_CACHE_FILE, "r") as f:
-            entity_cache = json.load(f)
-    except Exception as e:
-        logger.warning(f"Could not load entity cache: {e}")
-
-def save_entity_to_cache(group_id: int, entity):
-    try:
-        entity_cache[str(group_id)] = {
-            "id": entity.id,
-            "access_hash": getattr(entity, "access_hash", None),
-            "title": getattr(entity, "title", None),
-            "username": getattr(entity, "username", None),
-        }
-        with open(ENTITY_CACHE_FILE, "w") as f:
-            json.dump(entity_cache, f, indent=2)
-        logger.debug(f"Entity for group {group_id} cached.")
-    except Exception as e:
-        logger.error(f"Failed to save entity cache: {e}")
-
-async def resolve_channel(client, group_id: int):
-    """
-    Resolve channel entity correctly using Telethon's get_entity.
-    Works with numeric IDs, usernames, or cached entities.
-    """
-    try:
-        # Try cache first
-        if str(group_id) in entity_cache:
-            cached = entity_cache[str(group_id)]
-            try:
-                ent = await client.get_input_entity(cached["id"])
-                logger.debug(f"Resolved group {group_id} from cache.")
-                return ent, "cache"
-            except Exception as e:
-                logger.warning(f"Cache failed for {group_id}: {e}. Trying fresh resolve...")
-
-        # Resolve fresh using numeric ID
-        ent = await client.get_entity(group_id)
-        save_entity_to_cache(group_id, ent)
-        return ent, "fresh"
-
-    except ChannelPrivateError:
-        logger.error(f"Group {group_id} is private or inaccessible.")
-    except RPCError as e:
-        logger.error(f"RPCError resolving group {group_id}: {e}")
-    except ValueError as e:
-        logger.error(f"Cannot resolve group {group_id}: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error resolving group {group_id}: {e}", exc_info=True)
-
-    return None, "failed"
-
 # --- Telegram Client and Queue ---
 client = TelegramClient('userbot_session', API_ID, API_HASH)
 message_queue = asyncio.Queue()
 
-# Identify source4 for martingale defaults
+# --- Per-source signal counters ---
+signal_counts = {gid: 0 for gid in source_group_ids}
+
+# Source4 default martingale
 source4_id = int(os.getenv("SOURCE_GROUP_ID4")) if os.getenv("SOURCE_GROUP_ID4") else None
 
+# --- Already processed messages (to avoid duplicates) ---
+processed_messages = set()
+
 async def extract_signal(message: Message, source_group_id: int):
-    """Extract trading signals from messages."""
+    """Extracts a trading signal from a message based on text/emoji."""
     try:
+        if message.id in processed_messages:
+            return None
+        processed_messages.add(message.id)
+
         signal = {"source_group_id": source_group_id}
         text = message.message
         if not text:
             return None
 
-        # Patterns
+        # --- Regex patterns ---
         currency_pair_pattern = re.compile(
             r"(?:PAIR:?|CURRENCY PAIR:?|PAIR\s*:?|CURRENCY\s*PAIR\s*:?)\s*([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3})?)|"
             r"([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3,5})?)"
         )
+        direction_pattern = re.compile(r"(?i)(BUY|CALL|SELL)|(🟩|🟥|🔼|🔽|🟢)")
         entry_time_pattern = re.compile(
             r"(?:Entry at|ENTRY at|Entry time|TIME \(UTC.*?\)):?\s+(\d{1,2}:\d{2}(?::\d{2})?)|"
             r"([0-9]+\:[0-9]+)\s*:\s*(?:CALL|SELL)"
         )
-        martingale_pattern = re.compile(r"(?:Martingale levels?|PROTECTION|M-)\s*(\d+)")
 
-        # Signal markers
-        is_signal_text = any(kw in text.upper() for kw in ["BUY", "CALL", "SELL", "OTC", "EXPIRATION", "ENTRY", "TIME", "PROTECTION"])
-        is_signal_emoji = any(em in text for em in ["🟩", "🟥", "🔼", "🔽", "🟢"])
+        # --- Check if message contains signal keywords ---
+        is_signal_text = any(
+            kw in text.upper() for kw in ["BUY", "CALL", "SELL", "OTC", "EXPIRATION", "ENTRY", "TIME", "PROTECTION"]
+        )
+        is_signal_emoji = any(
+            em in text for em in ["🟩", "🟥", "🔼", "🔽", "🟢"]
+        )
         if not (is_signal_text or is_signal_emoji):
             return None
 
-        # Currency Pair
+        # --- Extract currency pair ---
         match = currency_pair_pattern.search(text)
         if match:
             signal["currency_pair"] = (match.group(1) or match.group(2)).replace(" ", "").replace("_", "/").strip().upper()
 
-        # Direction
+        # --- Extract direction ---
         if "BUY" in text.upper() or "CALL" in text.upper() or "🟩" in text or "🔼" in text or "🟢" in text:
             signal["direction"] = "CALL"
         elif "SELL" in text.upper() or "🟥" in text or "🔽" in text:
             signal["direction"] = "SELL"
 
-        # Entry Time
+        # --- Extract entry time ---
         match = entry_time_pattern.search(text)
         if match:
             signal["entry_time"] = match.group(1) or match.group(2)
 
-        # Martingale
+        # --- Extract martingale levels ---
         martingale_levels_found = False
         if source_group_id == source4_id:
-            signal["martingale_levels"] = 2
+            signal["martingale_levels"] = 2  # default for source4
             martingale_levels_found = True
         else:
-            match = martingale_pattern.search(text)
-            if match:
-                signal["martingale_levels"] = int(match.group(1))
+            martingale_matches = re.findall(r"(?:Martingale levels?|PROTECTION|M-).*?(\d+)", text, re.IGNORECASE)
+            if martingale_matches:
+                signal["martingale_levels"] = max(int(x) for x in martingale_matches)
                 martingale_levels_found = True
         if not martingale_levels_found:
             signal["martingale_levels"] = 0
 
-        if not signal.get('currency_pair') or not signal.get('direction'):
+        # --- Ensure minimum required info ---
+        if not signal.get("currency_pair") or not signal.get("direction"):
             return None
+
+        # --- Update per-source counter ---
+        signal_counts[source_group_id] += 1
 
         logger.info(f"Extracted signal from message {message.id}: {signal}")
         return signal
@@ -180,7 +139,7 @@ async def extract_signal(message: Message, source_group_id: int):
         return None
 
 async def process_message_queue():
-    """Process queued messages."""
+    """Consumer task to process messages from the queue."""
     logger.info("Message processing queue started.")
     while True:
         try:
@@ -190,51 +149,51 @@ async def process_message_queue():
                 logger.info(f"Processed signal: {signal}")
             message_queue.task_done()
         except asyncio.CancelledError:
+            logger.warning("Message processing queue task cancelled.")
             break
         except Exception as e:
-            logger.error(f"Error processing message: {e}", exc_info=True)
+            logger.error(f"Error processing message from queue: {e}", exc_info=True)
             message_queue.task_done()
 
-async def periodic_channel_check(client, group_ids, interval=300):
-    """Keep channels active by periodic fetch."""
+async def periodic_channel_check(interval=300):
+    """Periodically fetch last message to keep updates active."""
     logger.info("Starting periodic channel check task.")
     while True:
-        for group_id in group_ids:
+        for group_id in source_group_ids:
             try:
-                entity, mode = await resolve_channel(client, group_id)
-                if entity:
-                    await client.get_messages(entity, limit=1)
-                    logger.debug(f"Periodic check for channel {group_id} via {mode}.")
+                entity = await client.get_entity(group_id)
+                await client.get_messages(entity, limit=1)
+                logger.debug(f"Manually fetched update for channel {group_id}")
             except Exception as e:
-                logger.error(f"Periodic check failed for {group_id}: {e}")
+                logger.error(f"Failed periodic check for channel {group_id}: {e}")
         await asyncio.sleep(interval)
 
 @client.on(events.NewMessage(chats=source_group_ids))
 async def handler(event):
-    """Handle new incoming messages."""
+    """Event handler for new messages in specified chats."""
     try:
         message = event.message
         await message_queue.put((message, event.chat_id))
-        logger.debug("Queued message %s from chat %s", message.id, event.chat_id)
     except Exception as e:
-        logger.error(f"Error in event handler: {e}", exc_info=True)
+        logger.error(f"Error in event handler for message {event.message.id}: {e}", exc_info=True)
 
 async def main():
+    """Main function to start the bot."""
     try:
         await client.start(phone=PHONE_NUMBER)
         logger.info("Client started and connected successfully.")
 
-        # Verify membership
+        # Verify membership for all channels
         for group_id in source_group_ids:
-            entity, mode = await resolve_channel(client, group_id)
-            if entity:
-                logger.info(f"Verified membership for group: {group_id} via {mode} ({getattr(entity, 'title', '')})")
-            else:
-                logger.error(f"Could not verify membership for group {group_id}")
+            try:
+                entity = await client.get_entity(group_id)
+                logger.info(f"Verified membership for group: {group_id} via fresh ({getattr(entity, 'title', 'N/A')})")
+            except Exception as e:
+                logger.error(f"Could not verify membership for group {group_id}: {e}")
 
         # Start tasks
         processor_task = asyncio.create_task(process_message_queue())
-        periodic_task = asyncio.create_task(periodic_channel_check(client, source_group_ids))
+        periodic_task = asyncio.create_task(periodic_channel_check())
 
         await client.run_until_disconnected()
 
@@ -242,22 +201,24 @@ async def main():
         logger.error(f"Failed to start Telethon client: {e}", exc_info=True)
 
     finally:
+        # Graceful shutdown
         try:
             await asyncio.wait_for(message_queue.join(), timeout=30.0)
         except asyncio.TimeoutError:
-            logger.warning("Queue not empty at shutdown.")
+            logger.warning("Queue did not empty in time.")
+
         processor_task.cancel()
         periodic_task.cancel()
         await asyncio.gather(processor_task, periodic_task, return_exceptions=True)
         await client.disconnect()
         logger.info("Application shutdown complete.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Program interrupted by user. Exiting...")
     except Exception as e:
-        logger.error(f"Unhandled error: {e}", exc_info=True)
+        logger.error(f"An unhandled error occurred: {e}", exc_info=True)
         sys.exit(1)
-    
+        

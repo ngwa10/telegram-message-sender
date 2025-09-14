@@ -187,7 +187,7 @@ async def main():
         # Verify membership for all channels
         for group_id in source_group_ids:
             try:
-                entity = await client.get_entity(group_id)
+                entity = await client.get_entity(PeerChannel(group_id))
                 logger.info(f"Verified membership for group: {group_id} ({entity.title})")
             except ValueError:
                 logger.error(f"Client is not a member of group with ID: {group_id}. Cannot listen for messages.")

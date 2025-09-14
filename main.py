@@ -1,111 +1,222 @@
+#!/usr/bin/env python3
+"""
+Robust Telegram message listener for multiple source channels.
+
+Features:
+- Resolves channels at startup and registers a NewMessage handler using resolved entities
+  (avoids the "only first source works" issue).
+- Caches channel id -> access_hash in channels_cache.json for faster startup.
+- Exponential backoff + retries for transient RPC/network errors.
+- Graceful shutdown and queue draining.
+- Configurable via .env: API_ID, API_HASH, PHONE_NUMBER, SOURCE_GROUP_ID1..4, LOG_LEVEL, PERIODIC_INTERVAL.
+"""
+
 import asyncio
+import json
 import logging
 import os
+import random
 import re
 import sys
+from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import ChannelPrivateError, RPCError
-from telethon.tl.types import Message
+from telethon.tl.types import Message, InputPeerChannel
 
-# --- Logging setup ---
+# ---------------------------
+# Config and constants
+# ---------------------------
+CACHE_PATH = Path("channels_cache.json")
+BACKOFF_BASE = 1.0    # seconds
+BACKOFF_FACTOR = 2.0
+BACKOFF_MAX = 30.0    # seconds
+MAX_RETRIES = 4       # number of retries for transient errors
+DEFAULT_PERIODIC_INTERVAL = 300  # seconds
+DEFAULT_LOG_LEVEL = "INFO"
+
+# ---------------------------
+# Logging setup (configurable via env)
+# ---------------------------
+env_path = find_dotenv()
+if env_path:
+    load_dotenv(env_path)
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
+numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more detailed output
+    level=numeric_level,
     format='[%(asctime)s] %(levelname)s - %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# --- Load environment variables ---
-env_path = find_dotenv()
-if not env_path:
-    logger.error("No .env file found.")
-    sys.exit(1)
-load_dotenv(env_path)
-
-# --- API Credentials and Phone Number ---
+# ---------------------------
+# Load required env vars
+# ---------------------------
 try:
-    API_ID = os.getenv("API_ID")
+    API_ID = int(os.getenv("API_ID") or "")
     API_HASH = os.getenv("API_HASH")
     PHONE_NUMBER = os.getenv("PHONE_NUMBER")
     if not all([API_ID, API_HASH, PHONE_NUMBER]):
         raise ValueError("API_ID, API_HASH, or PHONE_NUMBER not set in .env")
-    API_ID = int(API_ID)
-except (ValueError, TypeError) as e:
-    logger.error(f"Failed to load environment variables: {e}")
+except Exception as e:
+    logger.error("Missing or invalid API credentials: %s", e)
     sys.exit(1)
 
-# --- Source Group IDs ---
-try:
-    source_group_ids = [
-        int(gid) for gid in [
-            os.getenv("SOURCE_GROUP_ID1"),
-            os.getenv("SOURCE_GROUP_ID2"),
-            os.getenv("SOURCE_GROUP_ID3"),
-            os.getenv("SOURCE_GROUP_ID4")
-        ] if gid is not None and gid.strip()
-    ]
-    if not source_group_ids:
-        raise ValueError("No valid SOURCE_GROUP_ID found in .env")
-except (ValueError, TypeError) as e:
-    logger.error(f"Failed to load group IDs from .env: {e}")
+# Source groups: read up to 8 possible IDs to be flexible
+source_group_ids = []
+for i in range(1, 9):
+    v = os.getenv(f"SOURCE_GROUP_ID{i}")
+    if v and v.strip():
+        try:
+            source_group_ids.append(int(v.strip()))
+        except ValueError:
+            # keep non-int forms (usernames) as strings
+            source_group_ids.append(v.strip())
+
+if not source_group_ids:
+    logger.error("No SOURCE_GROUP_IDs found in .env (SOURCE_GROUP_ID1..8). Exiting.")
     sys.exit(1)
 
-# --- Telegram Client and Queue ---
+# Optional config
+PERIODIC_INTERVAL = int(os.getenv("PERIODIC_INTERVAL") or DEFAULT_PERIODIC_INTERVAL)
+# Identify special source for default martingale levels if set
+source4_id = int(os.getenv("SOURCE_GROUP_ID4")) if os.getenv("SOURCE_GROUP_ID4") else None
+
+# ---------------------------
+# Telethon client + queue
+# ---------------------------
 client = TelegramClient('userbot_session', API_ID, API_HASH)
 message_queue = asyncio.Queue()
 
-# Identify the specific source for default martingale levels
-source4_id = int(os.getenv("SOURCE_GROUP_ID4")) if os.getenv("SOURCE_GROUP_ID4") else None
+# ---------------------------
+# Cache helpers
+# ---------------------------
+def load_cache() -> dict:
+    if not CACHE_PATH.exists():
+        return {}
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return {int(k): int(v) for k, v in data.items()}
+    except Exception as e:
+        logger.warning("Failed to load cache file: %s. Starting fresh cache.", e)
+        return {}
 
+def save_cache(cache: dict):
+    try:
+        serializable = {str(k): int(v) for k, v in cache.items()}
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+        logger.debug("Saved channel cache to %s", CACHE_PATH)
+    except Exception as e:
+        logger.error("Failed to save cache: %s", e)
+
+_channel_cache = load_cache()  # {channel_id: access_hash}
+
+# ---------------------------
+# Channel resolution + retries
+# ---------------------------
 async def resolve_channel(client, group_ref):
     """
-    Resolve a channel reference to a usable entity/input entity.
-    group_ref can be:
-     - int (channel id) possibly negative like -100123...
-     - string username '@channel' or 'channel'
-     - invite link
-    Returns (entity, resolved_by) where entity is a Telethon entity or input entity,
-    and resolved_by is one of: 'get_entity', 'get_input_entity'
-    Raises the original exception if resolution fails.
+    Resolve `group_ref` to an entity or input entity.
+
+    Returns (entity_or_inputpeer, 'cache'|'get_entity'|'get_input_entity').
+    Raises ChannelPrivateError for private/no-access.
     """
+    # Normalize '-100...' strings to int where possible
     try:
-        # Normalize numeric forms like '-100123...' to int where possible
         if isinstance(group_ref, str) and group_ref.startswith('-100'):
             try:
                 group_ref = int(group_ref)
             except Exception:
                 pass
 
-        # Prefer get_entity first (gives full Channel/User object including title)
+        # Try cache if group_ref is an integer channel id
+        if isinstance(group_ref, int) or (isinstance(group_ref, str) and group_ref.lstrip('-').isdigit()):
+            try:
+                cid = int(group_ref)
+                if cid in _channel_cache:
+                    ahash = _channel_cache[cid]
+                    logger.debug("Using cached access_hash for channel %s", cid)
+                    return InputPeerChannel(channel_id=cid, access_hash=ahash), 'cache'
+            except Exception as e:
+                logger.debug("Cache attempt failed for %r: %s", group_ref, e)
+
+        # Try get_entity (prefers server-resolved full object with access_hash)
         try:
             ent = await client.get_entity(group_ref)
+            ent_id = getattr(ent, "id", None)
+            ent_ah = getattr(ent, "access_hash", None)
+            if ent_id and ent_ah:
+                _channel_cache[int(ent_id)] = int(ent_ah)
+                save_cache(_channel_cache)
             return ent, 'get_entity'
         except (ValueError, TypeError, RPCError) as e:
-            # Fall back to get_input_entity which can fetch an input peer
             logger.debug("get_entity failed for %r: %s. Falling back to get_input_entity", group_ref, e)
 
         ent_in = await client.get_input_entity(group_ref)
         return ent_in, 'get_input_entity'
 
-    except ChannelPrivateError as e:
-        logger.error("ChannelPrivateError resolving %r: %s", group_ref, e)
+    except ChannelPrivateError:
+        # propagate permanent access issues up
         raise
-    except Exception as e:
-        logger.exception("Failed to resolve channel %r", group_ref)
+    except Exception:
+        # propagate others to caller (retry wrapper will handle)
         raise
 
-async def extract_signal(message: Message, source_group_id: int):
-    """Extracts a trading signal from a message based on various formats."""
+async def resolve_channel_with_retries(client, group_ref, max_retries=MAX_RETRIES):
+    """
+    Wrapper around resolve_channel that retries on transient errors with exponential backoff + jitter.
+    """
+    attempt = 0
+    while True:
+        try:
+            ent, mode = await resolve_channel(client, group_ref)
+            return ent, mode
+        except ChannelPrivateError:
+            logger.error("ChannelPrivateError while resolving %r -> access revoked or channel private.", group_ref)
+            raise
+        except RPCError as e:
+            attempt += 1
+            if attempt > max_retries:
+                logger.exception("Max retries reached resolving %r; last error: %s", group_ref, e)
+                raise
+            backoff = min(BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt - 1)), BACKOFF_MAX)
+            jitter = random.uniform(0, backoff * 0.25)
+            sleep_for = backoff + jitter
+            logger.warning("RPCError resolving %r (attempt %d/%d). Backing off %.2fs...", group_ref, attempt, max_retries, sleep_for)
+            await asyncio.sleep(sleep_for)
+        except Exception as e:
+            attempt += 1
+            if attempt > max_retries:
+                logger.exception("Failed to resolve %r after %d attempts; last error: %s", group_ref, attempt - 1, e)
+                raise
+            backoff = min(BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt - 1)), BACKOFF_MAX)
+            jitter = random.uniform(0, backoff * 0.25)
+            sleep_for = backoff + jitter
+            logger.warning("Error resolving %r (attempt %d/%d). Backing off %.2fs...", group_ref, attempt, max_retries, sleep_for)
+            await asyncio.sleep(sleep_for)
+
+# ---------------------------
+# Signal extraction function
+# ---------------------------
+async def extract_signal(message: Message, source_group_id):
+    """
+    Extract trading signal from message. Returns dict or None.
+    Accepts source_group_id as the resolved chat id (int) for clarity.
+    """
     try:
         signal = {"source_group_id": source_group_id}
         text = message.message
         if not text:
-            logger.debug(f"Message {message.id} from group {source_group_id} is empty.")
+            logger.debug("Message %s from %s empty", getattr(message, "id", "[no-id]"), source_group_id)
             return None
 
-        # --- Flexible Regex Patterns ---
+        # Patterns
         currency_pair_pattern = re.compile(
             r"(?:PAIR:?|CURRENCY PAIR:?|PAIR\s*:?|CURRENCY\s*PAIR\s*:?)\s*([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3})?)|"
             r"([A-Z]{3,5}[/ _-][A-Z]{3,5}(?:-[A-Z]{3,5})?)"
@@ -116,163 +227,180 @@ async def extract_signal(message: Message, source_group_id: int):
         )
         martingale_pattern = re.compile(r"(?:Martingale levels?|PROTECTION|M-)\s*(\d+)")
 
-        # --- Check for signal keywords ---
         is_signal_text = any(
             kw in text.upper() for kw in ["BUY", "CALL", "SELL", "OTC", "EXPIRATION", "ENTRY", "TIME", "PROTECTION"]
         )
-        is_signal_emoji = any(
-            em in text for em in ["🟩", "🟥", "🔼", "🔽", "🟢"]
-        )
+        is_signal_emoji = any(em in text for em in ["🟩", "🟥", "🔼", "🔽", "🟢"])
 
         if not (is_signal_text or is_signal_emoji):
-            logger.debug(f"Message {message.id} from group {source_group_id} does not contain signal keywords.")
+            logger.debug("Message %s from %s not a signal (no keywords).", getattr(message, "id", "[no-id]"), source_group_id)
             return None
 
-        # --- Extract Currency Pair ---
+        # currency
         match = currency_pair_pattern.search(text)
         if match:
             pair = (match.group(1) or match.group(2))
             if pair:
                 signal["currency_pair"] = pair.replace(" ", "").replace("_", "/").strip().upper()
 
-        # --- Extract Direction ---
+        # direction
         if "BUY" in text.upper() or "CALL" in text.upper() or "🟩" in text or "🔼" in text or "🟢" in text:
             signal["direction"] = "CALL"
         elif "SELL" in text.upper() or "🟥" in text or "🔽" in text:
             signal["direction"] = "SELL"
 
-        # --- Extract Entry Time ---
+        # entry time
         match = entry_time_pattern.search(text)
         if match:
             signal["entry_time"] = match.group(1) or match.group(2)
 
-        # --- Extract Martingale Levels ---
+        # martingale levels
         martingale_levels_found = False
-        if source_group_id == source4_id:
-            signal["martingale_levels"] = 2
-            martingale_levels_found = True
-        else:
+        try:
+            if source_group_id == source4_id:
+                signal["martingale_levels"] = 2
+                martingale_levels_found = True
+        except Exception:
+            pass
+
+        if not martingale_levels_found:
             match = martingale_pattern.search(text)
             if match:
                 try:
                     signal["martingale_levels"] = int(match.group(1))
                     martingale_levels_found = True
-                except ValueError:
+                except Exception:
                     pass
 
         if not martingale_levels_found:
             signal["martingale_levels"] = 0
 
-        # --- Check for minimum signal info ---
-        if not signal.get('currency_pair') or not signal.get('direction'):
-            logger.info(f"Message {message.id} from group {source_group_id} is not a complete signal.")
+        # minimal fields check
+        if not signal.get("currency_pair") or not signal.get("direction"):
+            logger.info("Message %s from %s incomplete signal.", getattr(message, "id", "[no-id]"), source_group_id)
             return None
 
-        logger.info(f"Extracted signal from message {message.id}: {signal}")
+        logger.info("Extracted signal from message %s: %s", getattr(message, "id", "[no-id]"), signal)
         return signal
 
     except Exception as e:
-        logger.error(f"Error extracting signal from message {getattr(message, 'id', '[no-id]')}: {e}", exc_info=True)
+        logger.exception("Error extracting signal from message %s: %s", getattr(message, "id", "[no-id]"), e)
         return None
 
+# ---------------------------
+# Queue consumer
+# ---------------------------
 async def process_message_queue():
-    """Consumer task to process messages from the queue."""
     logger.info("Message processing queue started.")
     while True:
         try:
-            message, source_group_id = await message_queue.get()
-            signal = await extract_signal(message, source_group_id)
+            message, source_chat_id = await message_queue.get()
+            signal = await extract_signal(message, source_chat_id)
             if signal:
-                logger.info(f"Processed signal: {signal}")
+                # Do something useful with the signal (placeholder)
+                logger.info("Processed signal: %s", signal)
             message_queue.task_done()
         except asyncio.CancelledError:
-            logger.warning("Message processing queue task cancelled.")
+            logger.warning("Message processing queue cancelled.")
             break
         except Exception as e:
-            logger.error(f"Error processing message from queue: {e}", exc_info=True)
+            logger.exception("Error processing message from queue: %s", e)
             try:
                 message_queue.task_done()
             except Exception:
                 pass
 
-async def periodic_channel_check(client, group_ids, interval=300):
+# ---------------------------
+# Event handler (defined but not registered as decorator)
+# ---------------------------
+async def handler(event):
     """
-    Periodically fetches messages from specified channels to keep the update
-    stream active. Resolves each channel every run (robust against stale caches).
+    Generic handler that extracts a stable source_chat_id and enqueues the message.
+    Registered dynamically after entities are resolved.
     """
-    logger.info("Starting periodic channel check task.")
+    try:
+        message = event.message
+        # Prefer event.chat_id (works for many peer types)
+        source_chat_id = getattr(event, "chat_id", None)
+        if source_chat_id is None:
+            # fallback to message.peer_id which may be a PeerChannel/PeerChat/PeerUser
+            pid = getattr(message, "peer_id", None)
+            if pid is not None:
+                # try common attributes
+                source_chat_id = getattr(pid, "channel_id", None) or getattr(pid, "chat_id", None) or getattr(pid, "user_id", None)
+        # Final fallback to event.sender_id
+        if source_chat_id is None:
+            source_chat_id = getattr(event, "sender_id", None)
+
+        logger.debug("Received message id=%s from chat=%s", getattr(message, "id", "[no-id]"), source_chat_id)
+        await message_queue.put((message, source_chat_id))
+    except Exception as e:
+        logger.exception("Error in event handler for message %s: %s", getattr(event.message, "id", "[no-id]"), e)
+
+# ---------------------------
+# Periodic check task (keeps updates active)
+# ---------------------------
+async def periodic_channel_check(client, group_ids, interval=PERIODIC_INTERVAL):
+    logger.info("Starting periodic channel check task (interval=%s seconds)", interval)
     while True:
         for group_id in group_ids:
             try:
-                ent, mode = await resolve_channel(client, group_id)
-                # Fetch the last message to keep updates active. get_messages accepts both entity and input entity.
+                ent, mode = await resolve_channel_with_retries(client, group_id)
                 msgs = await client.get_messages(ent, limit=1)
                 if msgs:
-                    logger.debug(f"Manually fetched update for channel {group_id}; latest msg id={msgs[0].id}")
+                    logger.debug("Periodic check OK for %s (mode=%s); latest id=%s", group_id, mode, msgs[0].id)
                 else:
-                    logger.debug(f"No messages found for channel {group_id} on periodic check.")
+                    logger.debug("Periodic check: no messages for %s (mode=%s).", group_id, mode)
             except ChannelPrivateError:
-                logger.error(f"Channel {group_id} is private or your account lost access.")
+                logger.error("Channel %s is private or your account lost access.", group_id)
+                # Remove from cache to force re-resolve later if needed
+                try:
+                    cid = int(group_id)
+                    if cid in _channel_cache:
+                        logger.info("Removing %s from cache due to access issues.", cid)
+                        _channel_cache.pop(cid, None)
+                        save_cache(_channel_cache)
+                except Exception:
+                    pass
             except Exception as e:
-                logger.error(f"Failed to perform periodic check for channel {group_id}: {e}", exc_info=True)
-        await asyncio.sleep(interval)  # Wait for the specified interval (e.g., 5 minutes)
+                logger.exception("Failed periodic check for %s: %s", group_id, e)
+        await asyncio.sleep(interval)
 
-@client.on(events.NewMessage(chats=source_group_ids))
-async def handler(event):
-    """Event handler for new messages in specified chats."""
-    try:
-        message = event.message
-        await message_queue.put((message, event.chat_id))
-    except Exception as e:
-        logger.error(f"Error in event handler for message {getattr(event.message, 'id', '[no-id]')}: {e}", exc_info=True)
-
+# ---------------------------
+# Main startup & registration
+# ---------------------------
 async def main():
-    """Main function to start the bot and message processor."""
     try:
         await client.start(phone=PHONE_NUMBER)
         logger.info("Client started and connected successfully.")
 
-        # Verify membership for all channels (resolve and log friendly title when possible)
-        for group_id in source_group_ids:
+        # Resolve channels and collect resolved peers for handler registration
+        resolved_peers = []
+        resolved_map = {}  # map resolved entity -> original config ref (for logging)
+        for group_ref in source_group_ids:
             try:
-                entity = await client.get_entity(group_id)
-                friendly = getattr(entity, 'title', getattr(entity, 'username', str(entity)))
-                logger.info(f"Verified membership for group: {group_id} ({friendly})")
-            except ValueError:
-                logger.error(f"Client is not a member of group with ID: {group_id}. Cannot listen for messages.")
+                ent, mode = await resolve_channel_with_retries(client, group_ref)
+                resolved_peers.append(ent)
+                # For easier logging later — try to obtain stable id
+                resolved_id = getattr(ent, "channel_id", None) or getattr(ent, "id", None) or getattr(ent, "user_id", None)
+                resolved_map[resolved_id] = (group_ref, mode)
+                friendly = getattr(ent, "title", getattr(ent, "username", str(ent)))
+                logger.info("Resolved %r -> %s (mode=%s)", group_ref, friendly, mode)
+            except ChannelPrivateError:
+                logger.error("Cannot resolve %r: access revoked or channel private.", group_ref)
             except Exception as e:
-                logger.error(f"Could not resolve group {group_id}: {e}")
+                logger.error("Failed to resolve %r: %s", group_ref, e)
 
-        # Start the message processing and periodic checking tasks
-        processor_task = asyncio.create_task(process_message_queue())
-        periodic_task = asyncio.create_task(periodic_channel_check(client, source_group_ids))
+        if not resolved_peers:
+            logger.error("No chats resolved for event handler. Exiting.")
+            await client.disconnect()
+            return
 
-        await client.run_until_disconnected()
-        logger.info("Client disconnected. Shutting down...")
-
-    except Exception as e:
-        logger.error(f"Failed to start Telethon client: {e}", exc_info=True)
-        return
-
-    finally:
-        try:
-            # Cleanup tasks gracefully
-            await asyncio.wait_for(message_queue.join(), timeout=30.0)
-        except asyncio.TimeoutError:
-            logger.warning("Queue did not empty in time. Some messages may not be processed.")
-
-        processor_task.cancel()
-        periodic_task.cancel()
-        await asyncio.gather(processor_task, periodic_task, return_exceptions=True)
-        await client.disconnect()
-        logger.info("Application shutdown complete.")
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Program interrupted by user. Exiting...")
-    except Exception as e:
-        logger.error(f"An unhandled error occurred: {e}", exc_info=True)
-        sys.exit(1)
-        
+        # Register handler dynamically using the resolved peers/entities
+        client.add_event_handler(handler, events.NewMessage(chats=resolved_peers))
+        logger.info("Registered NewMessage handler for %d chats.", len(resolved_peers))
+        if numeric_level <= logging.DEBUG:
+            for ent in resolved_peers:
+                logger.debug("Handler registered for entity: %r (id=%s, title=%s, username=%s)",
+                             ent, getattr(ent, "id", None), geta
+    

@@ -152,13 +152,14 @@ async def process_message_queue():
 async def periodic_channel_check(client, group_ids, interval=300):
     """
     Periodically fetches messages from specified channels to keep the update
-    stream active. This is a workaround for Telegram's selective update behavior.
+    stream active.
     """
     logger.info("Starting periodic channel check task.")
     while True:
         for group_id in group_ids:
             try:
-                entity = await client.get_entity(PeerChannel(group_id * -1))
+                # Use abs(group_id) for the PeerChannel constructor
+                entity = await client.get_entity(PeerChannel(abs(group_id)))
                 # Fetching the last message forces an update from Telegram's servers.
                 await client.get_messages(entity, limit=1)
                 logger.debug(f"Manually fetched update for channel {group_id} ({entity.title}).")
@@ -224,4 +225,3 @@ if __name__ == '__main__':
         logger.error(f"An unhandled error occurred: {e}", exc_info=True)
         sys.exit(1)
 
-            

@@ -52,18 +52,20 @@ anna_trader_id = int(os.getenv("SOURCE_GROUP_ID2"))
 # --- Telegram client ---
 client = TelegramClient('userbot_session', API_ID, API_HASH)
 message_queue = asyncio.Queue()
+channel_names = {}  # store ID → name mapping
 
 # --- Signal detection ---
 async def extract_signal(message: Message, source_group_id: int):
     text = message.message
     if not text:
+        logger.debug(f"Message {message.id} from {channel_names.get(source_group_id, source_group_id)} has no text.")
         return None
 
     signal = {"source_group_id": source_group_id}
 
     # --- Detect currency pair ---
     pair_pattern = re.compile(
-        r"(?:PAIR|CURRENCY PAIR|Asset|📊)\s*[:\-]?\s*([A-Z]{3,5}[/\-_][A-Z]{3,5}(?:-[A-Z]{3,5})?|CRYPTO IDX)",
+        r"(?:PAIR|CURRENCY PAIR|Asset|📊)?\s*[:\-]?\s*([A-Z]{3,5}[/\-_][A-Z]{3,5}(?:-[A-Z]{3,5})?|CRYPTO IDX)",
         re.IGNORECASE
     )
     match = pair_pattern.search(text)
@@ -71,12 +73,12 @@ async def extract_signal(message: Message, source_group_id: int):
         signal["currency_pair"] = match.group(1).replace("_", "/").upper()
 
     # --- Detect direction ---
-    if any(x in text.upper() for x in ["BUY", "CALL", "PUT", "🟩", "🟢", "🔼"]):
+    if any(x in text.upper() for x in ["BUY", "CALL", "🟩", "🟢", "🔼"]):
         signal["direction"] = "CALL"
-    elif any(x in text.upper() for x in ["SELL", "🟥", "🔽"]):
+    elif any(x in text.upper() for x in ["SELL", "PUT", "🟥", "🔽"]):
         signal["direction"] = "SELL"
 
-    # --- Optional entry time (for logging only) ---
+    # --- Optional entry time ---
     time_pattern = re.compile(r"(\d{1,2}:\d{2}(?::\d{2})?)")
     match = time_pattern.search(text)
     if match:
@@ -114,11 +116,12 @@ async def extract_signal(message: Message, source_group_id: int):
 
     # --- Validation: must have pair + direction ---
     if not signal.get("currency_pair") or not signal.get("direction"):
+        logger.warning(f"❌ No valid signal found in message {message.id} from {channel_names.get(source_group_id, source_group_id)}")
         return None
 
     # --- Log details ---
     logger.info(
-        f"Signal detected from {source_group_id}: "
+        f"✅ Signal detected from {channel_names.get(source_group_id, source_group_id)}: "
         f"Pair={signal.get('currency_pair')}, "
         f"Direction={signal.get('direction')}, "
         f"Entry={signal.get('entry_time', 'N/A')}, "
@@ -136,7 +139,7 @@ async def process_message_queue():
             signal = await extract_signal(message, source_group_id)
             if signal:
                 await client.forward_messages(RECEIVING_CHANNEL_ID, message)
-                logger.info(f"✅ Forwarded message {message.id} to {RECEIVING_CHANNEL_ID}")
+                logger.info(f"📤 Forwarded message {message.id} to receiving channel")
         except Exception as e:
             logger.error(f"Error processing message from queue: {e}", exc_info=True)
         finally:
@@ -145,12 +148,21 @@ async def process_message_queue():
 # --- Event handler ---
 @client.on(events.NewMessage(chats=source_group_ids))
 async def handler(event):
+    logger.info(f"📩 New message from {channel_names.get(event.chat_id, event.chat_id)}: {event.message.text[:50]}...")
     await message_queue.put((event.message, event.chat_id))
 
 # --- Main ---
 async def main():
     await client.start(phone=PHONE_NUMBER)
     logger.info("Bot started ✅")
+
+    # preload channel names
+    for gid in source_group_ids:
+        try:
+            entity = await client.get_entity(gid)
+            channel_names[gid] = getattr(entity, "title", str(gid))
+        except Exception:
+            channel_names[gid] = str(gid)
 
     processor_task = asyncio.create_task(process_message_queue())
 
@@ -169,4 +181,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
-            
+        
